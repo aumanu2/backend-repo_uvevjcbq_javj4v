@@ -45,3 +45,14 @@ class Matchrequest(BaseModel):
     requester_email: EmailStr
     target_email: EmailStr
     note: Optional[str] = None
+
+
+class Otp(BaseModel):
+    """
+    Collection name: "otp"
+    One-time passcodes for magic-link/OTP login
+    """
+    email: EmailStr = Field(..., description="Email pengguna")
+    code: str = Field(..., description="6 digit OTP")
+    purpose: str = Field("login", description="Tujuan OTP")
+    expires_at: int = Field(..., description="Unix timestamp expiry (seconds)")

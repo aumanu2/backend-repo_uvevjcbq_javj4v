@@ -1,14 +1,22 @@
 import os
-from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Depends, Query
+import time
+import random
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Depends, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from database import db, create_document, get_documents
-from schemas import Userprofile, Message, Matchrequest
+from database import db, create_document
+from schemas import Userprofile, Message, Matchrequest, Otp
 import stripe
+from jose import jwt, JWTError
 
 # Stripe setup
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
+
+# Auth config
+SECRET_KEY = os.getenv("AUTH_SECRET_KEY", "super-secret-key-change-me")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_SECONDS = 60 * 60 * 24 * 7  # 7 days
 
 app = FastAPI(title="ASN Location Swap API")
 
@@ -21,6 +29,7 @@ app.add_middleware(
 )
 
 
+# ----------------- Models -----------------
 class CheckoutSessionRequest(BaseModel):
     email: EmailStr
 
@@ -37,6 +46,40 @@ class ProfileUpdateRequest(BaseModel):
     grade: Optional[str] = None
     current_region: Optional[str] = None
     desired_region: Optional[str] = None
+
+
+class SendMessageRequest(BaseModel):
+    to_email: EmailStr
+    content: str
+
+
+class OTPRequest(BaseModel):
+    email: EmailStr
+
+
+class OTPVerify(BaseModel):
+    email: EmailStr
+    code: str
+
+
+# ----------------- Utils -----------------
+def create_access_token(email: str) -> str:
+    now = int(time.time())
+    payload = {"sub": email, "iat": now, "exp": now + ACCESS_TOKEN_EXPIRE_SECONDS}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_current_user(authorization: Optional[str] = Header(None)) -> Optional[str]:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    try:
+        scheme, token = authorization.split(" ", 1)
+        if scheme.lower() != "bearer":
+            raise ValueError("Invalid auth scheme")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except (ValueError, JWTError):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
 @app.get("/")
@@ -77,6 +120,39 @@ def test_database():
     return response
 
 
+# ----------------- Auth (OTP) -----------------
+@app.post("/api/auth/request-otp")
+def request_otp(req: OTPRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    code = f"{random.randint(0, 999999):06d}"
+    expires_at = int(time.time()) + 600  # 10 minutes
+    db["otp"].delete_many({"email": req.email})
+    create_document("otp", {"email": req.email, "code": code, "purpose": "login", "expires_at": expires_at})
+    # In production, send the code via email provider. For dev/demo, we return it.
+    return {"status": "ok", "message": "OTP generated. Check your email.", "debug_code": code}
+
+
+@app.post("/api/auth/verify-otp")
+def verify_otp(req: OTPVerify):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    rec = db["otp"].find_one({"email": req.email, "code": req.code})
+    if not rec:
+        raise HTTPException(status_code=400, detail="Kode OTP tidak valid")
+    if int(time.time()) > int(rec.get("expires_at", 0)):
+        db["otp"].delete_many({"email": req.email})
+        raise HTTPException(status_code=400, detail="Kode OTP kedaluwarsa")
+    db["otp"].delete_many({"email": req.email})
+    token = create_access_token(req.email)
+    return {"access_token": token, "token_type": "bearer", "email": req.email}
+
+
+@app.get("/api/me")
+def me(email: str = Depends(get_current_user)):
+    return {"email": email}
+
+
 # ----------------- Stripe Checkout -----------------
 @app.post("/api/checkout/session")
 def create_checkout_session(payload: CheckoutSessionRequest):
@@ -95,7 +171,7 @@ def create_checkout_session(payload: CheckoutSessionRequest):
                             "name": "Langganan ASN Swap",
                             "description": "Akses fitur pencarian, match, dan chat"
                         },
-                        "unit_amount": 5000000,  # Rp50.000 per bulan (in cents of IDR => stripe uses smallest currency unit)
+                        "unit_amount": 5000000,
                         "recurring": {"interval": "month"}
                     },
                     "quantity": 1,
@@ -111,14 +187,15 @@ def create_checkout_session(payload: CheckoutSessionRequest):
 
 # ----------------- Profiles -----------------
 @app.post("/api/profile", response_model=dict)
-def create_or_update_profile(profile: ProfileCreateRequest):
+def create_or_update_profile(profile: ProfileCreateRequest, email: str = Depends(get_current_user)):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not configured")
-    # Upsert based on email
-    existing = db["userprofile"].find_one({"email": profile.email})
+    # Enforce email from token
     data = profile.model_dump()
+    data["email"] = email
+    existing = db["userprofile"].find_one({"email": email})
     if existing:
-        db["userprofile"].update_one({"email": profile.email}, {"$set": data})
+        db["userprofile"].update_one({"email": email}, {"$set": data})
         return {"status": "updated"}
     else:
         create_document("userprofile", data)
@@ -127,6 +204,8 @@ def create_or_update_profile(profile: ProfileCreateRequest):
 
 @app.get("/api/profile/{email}")
 def get_profile(email: str):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
     doc = db["userprofile"].find_one({"email": email}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Profile not found")
@@ -154,24 +233,20 @@ def search_profiles(
 
 
 # ----------------- Chat -----------------
-class SendMessageRequest(BaseModel):
-    from_email: EmailStr
-    to_email: EmailStr
-    content: str
-
-
 @app.post("/api/chat/send")
-def send_message(body: SendMessageRequest):
+def send_message(body: SendMessageRequest, email: str = Depends(get_current_user)):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not configured")
-    create_document("message", body.model_dump())
+    create_document("message", {"from_email": email, "to_email": body.to_email, "content": body.content, "read": False})
     return {"status": "sent"}
 
 
 @app.get("/api/chat/history")
-def get_history(a: EmailStr, b: EmailStr):
+def get_history(with_email: EmailStr, email: str = Depends(get_current_user)):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not configured")
+    a = email
+    b = with_email
     conv = list(db["message"].find({
         "$or": [
             {"from_email": a, "to_email": b},
@@ -189,18 +264,24 @@ class AdminVerifyRequest(BaseModel):
 
 @app.get("/api/admin/users")
 def admin_list_users():
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
     users = list(db["userprofile"].find({}, {"_id": 0}))
     return {"users": users}
 
 
 @app.post("/api/admin/verify")
 def admin_verify(req: AdminVerifyRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
     db["userprofile"].update_one({"email": req.email}, {"$set": {"is_verified": req.verified}})
     return {"status": "ok"}
 
 
 @app.delete("/api/admin/users/{email}")
 def admin_delete(email: str):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
     db["userprofile"].delete_one({"email": email})
     db["message"].delete_many({"$or": [{"from_email": email}, {"to_email": email}]})
     return {"status": "deleted"}
